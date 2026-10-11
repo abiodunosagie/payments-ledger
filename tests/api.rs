@@ -5,7 +5,7 @@
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use payments_ledger::{AppState, app, paystack};
+use payments_ledger::{AppState, app, idempotency, paystack};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -34,7 +34,7 @@ impl Api {
     async fn send(&self, req: Request<Body>) -> Reply {
         let res = self.router.clone().oneshot(req).await.unwrap();
         let status = res.status();
-        let replayed = res.headers().get("idempotent-replayed").is_some();
+        let replayed = res.headers().get(idempotency::REPLAYED_HEADER).is_some();
         let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
         let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         Reply {
@@ -59,7 +59,7 @@ impl Api {
             Request::post(path)
                 .header("authorization", format!("Bearer {API_KEY}"))
                 .header("content-type", "application/json")
-                .header("idempotency-key", key)
+                .header(idempotency::HEADER, key)
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )
@@ -133,6 +133,13 @@ fn charge(reference: &str, amount: i64, currency: &str) -> Value {
         "data": { "id": 1, "reference": reference, "amount": amount, "currency": currency,
                   "status": "success", "channel": "card" }
     })
+}
+
+async fn outcomes(pool: &PgPool) -> Vec<String> {
+    sqlx::query_scalar("select outcome from webhook_events order by id")
+        .fetch_all(pool)
+        .await
+        .unwrap()
 }
 
 /// The ledger's books: every cached balance equals the sum of its postings, every journal entry
@@ -253,19 +260,16 @@ async fn a_paystack_deposit_credits_the_account_exactly_once(pool: PgPool) {
     let reference = api.fund(ada, 500_000).await;
     assert_eq!(api.balance(ada).await, 500_000);
 
-    // Paystack retries deliveries; a second copy must not credit again.
-    let again = api
-        .webhook(&charge(&reference, 500_000, "NGN"), SECRET)
-        .await;
-    assert_eq!(again.status, StatusCode::OK);
+    // Paystack retries deliveries, and anyone holding a captured webhook can replay it. Copies
+    // must neither credit again nor grow the audit log.
+    for _ in 0..5 {
+        let again = api
+            .webhook(&charge(&reference, 500_000, "NGN"), SECRET)
+            .await;
+        assert_eq!(again.status, StatusCode::OK);
+    }
     assert_eq!(api.balance(ada).await, 500_000);
-
-    let outcomes: Vec<String> =
-        sqlx::query_scalar("select outcome from webhook_events order by id")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-    assert_eq!(outcomes, ["credited", "duplicate"]);
+    assert_eq!(outcomes(&pool).await, ["credited", "already_settled"]);
     assert_books_balance(&pool).await;
 }
 
@@ -312,36 +316,114 @@ async fn forged_mismatched_and_unknown_webhooks_credit_nothing(pool: PgPool) {
     assert_eq!(other_event.status, StatusCode::OK);
     assert_eq!(api.balance(ada).await, 0);
 
-    // The customer paid less than the deposit asked for: reject, never credit.
+    // The customer paid less than the deposit asked for: hold for review, never credit.
     let short = api.webhook(&charge(&reference, 100, "NGN"), SECRET).await;
     assert_eq!(short.status, StatusCode::OK);
     assert_eq!(api.balance(ada).await, 0);
     let deposit = api
         .get(&format!("/deposits/{}", d.body["id"].as_str().unwrap()))
         .await;
-    assert_eq!(deposit.body["status"], "rejected");
+    assert_eq!(deposit.body["status"], "needs_review");
 
-    // A later correct-looking delivery for a rejected deposit is not credited either.
+    // A later delivery for a deposit under review changes nothing; a person decides.
     let late = api
         .webhook(&charge(&reference, 10_000, "NGN"), SECRET)
         .await;
     assert_eq!(late.status, StatusCode::OK);
     assert_eq!(api.balance(ada).await, 0);
-
-    let outcomes: Vec<String> =
-        sqlx::query_scalar("select outcome from webhook_events order by id")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
     assert_eq!(
-        outcomes,
+        outcomes(&pool).await,
         [
             "unknown_reference",
             "ignored",
-            "rejected_mismatch",
-            "duplicate"
+            "needs_review",
+            "already_settled"
         ]
     );
+}
+
+/// Paystack sends many event types, most without charge fields. Every authentic one gets a 200
+/// so Paystack does not retry it for days.
+#[sqlx::test(migrator = "payments_ledger::MIGRATOR")]
+async fn every_authentic_event_gets_a_200_whatever_its_shape(pool: PgPool) {
+    let api = Api::new(pool.clone());
+    let sparse = api
+        .webhook(
+            &json!({ "event": "subscription.create", "data": { "plan": {} } }),
+            SECRET,
+        )
+        .await;
+    assert_eq!(sparse.status, StatusCode::OK);
+    let no_data = api
+        .webhook(&json!({ "event": "customeridentification.failed" }), SECRET)
+        .await;
+    assert_eq!(no_data.status, StatusCode::OK);
+    let broken_charge = api
+        .webhook(
+            &json!({ "event": "charge.success", "data": { "reference": "dep_x" } }),
+            SECRET,
+        )
+        .await;
+    assert_eq!(broken_charge.status, StatusCode::OK);
+    assert_eq!(outcomes(&pool).await, ["ignored", "ignored", "malformed"]);
+}
+
+/// A charge reported as not successful leaves the deposit open, so the customer's next,
+/// successful attempt with the same reference is still credited.
+#[sqlx::test(migrator = "payments_ledger::MIGRATOR")]
+async fn a_failed_charge_keeps_the_deposit_open_for_a_successful_one(pool: PgPool) {
+    let api = Api::new(pool.clone());
+    let ada = api.account("Ada", "NGN").await;
+    let d = api
+        .post(
+            "/deposits",
+            "d1",
+            json!({ "account_id": ada, "amount": 7_000 }),
+        )
+        .await;
+    let reference = d.body["reference"].as_str().unwrap().to_owned();
+    let mut failed = charge(&reference, 7_000, "NGN");
+    failed["data"]["status"] = json!("failed");
+    api.webhook(&failed, SECRET).await;
+    assert_eq!(api.balance(ada).await, 0);
+    api.webhook(&charge(&reference, 7_000, "NGN"), SECRET).await;
+    assert_eq!(api.balance(ada).await, 7_000);
+    assert_eq!(outcomes(&pool).await, ["not_successful", "credited"]);
+    assert_books_balance(&pool).await;
+}
+
+#[sqlx::test(migrator = "payments_ledger::MIGRATOR")]
+async fn control_characters_and_oversized_bodies_are_client_errors(pool: PgPool) {
+    let api = Api::new(pool.clone());
+    let ada = api.account("Ada", "NGN").await;
+    let bayo = api.account("Bayo", "NGN").await;
+    api.fund(ada, 100).await;
+
+    // Postgres cannot store NUL in text; it must be a 400 (stored and replayed), not a 500.
+    let nul =
+        json!({ "from_account": ada, "to_account": bayo, "amount": 1, "description": "rent\u{0}" });
+    let first = api.post("/transfers", "nul", nul.clone()).await;
+    assert_eq!(first.status, StatusCode::BAD_REQUEST, "{:?}", first.body);
+    let retry = api.post("/transfers", "nul", nul).await;
+    assert!(retry.replayed);
+    let named = api
+        .post(
+            "/accounts",
+            "nul-name",
+            json!({ "name": "A\u{0}da", "currency": "NGN" }),
+        )
+        .await;
+    assert_eq!(named.status, StatusCode::BAD_REQUEST);
+
+    let huge = api
+        .post(
+            "/accounts",
+            "huge",
+            json!({ "name": "x".repeat(100_000), "currency": "NGN" }),
+        )
+        .await;
+    assert_eq!(huge.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(api.balance(ada).await, 100);
 }
 
 #[sqlx::test(migrator = "payments_ledger::MIGRATOR")]

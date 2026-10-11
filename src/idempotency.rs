@@ -15,6 +15,10 @@ use sha2::{Digest, Sha256};
 use sqlx::PgConnection;
 
 pub const HEADER: &str = "idempotency-key";
+/// Set on a response replayed from an earlier request with the same key.
+pub const REPLAYED_HEADER: &str = "idempotent-replayed";
+/// Mirrors the `idempotency_keys.key` check in the migration.
+pub const MAX_KEY_LEN: usize = 200;
 
 /// The response a write produced: status and JSON body.
 pub type Outcome = (StatusCode, Value);
@@ -25,10 +29,10 @@ pub fn key_from(headers: &HeaderMap) -> Result<String, ApiError> {
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .unwrap_or("");
-    if key.is_empty() || key.len() > 200 {
-        return Err(ApiError::bad_request(
-            "an Idempotency-Key header (1 to 200 characters) is required on writes",
-        ));
+    if key.is_empty() || key.len() > MAX_KEY_LEN {
+        return Err(ApiError::bad_request(format!(
+            "an Idempotency-Key header (1 to {MAX_KEY_LEN} characters) is required on writes"
+        )));
     }
     Ok(key.to_owned())
 }

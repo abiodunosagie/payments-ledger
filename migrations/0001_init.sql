@@ -41,7 +41,9 @@ create index postings_account on postings (account_id, id);
 create index postings_entry on postings (entry_id);
 
 -- Every journal entry must sum to zero per currency, and each posting must be in its account's
--- currency. Deferred to commit time so all postings of an entry can be inserted first.
+-- currency. Deferred to commit time so all postings of an entry can be inserted first. It runs
+-- once per posting row, so an entry with N legs is checked N times; that is deliberate, since a
+-- per-statement trigger could not see which entries a transaction touched.
 create function check_entry_balanced() returns trigger
 language plpgsql as $$
 declare
@@ -91,20 +93,22 @@ create trigger journal_entries_append_only
     for each row execute function forbid_change();
 
 -- A deposit is created before the customer pays. Its reference is passed to Paystack, and the
--- webhook credits the account once, only if the amount and currency match.
+-- webhook credits the account once, only if the amount and currency match. A charge that does
+-- not match is held for a person to review instead of being credited or silently dropped.
 create table deposits (
     id           uuid primary key,
     account_id   uuid not null references accounts (id),
     reference    text not null unique,
     amount       bigint not null check (amount > 0),
     currency     text not null,
-    status       text not null default 'pending' check (status in ('pending', 'completed', 'rejected')),
+    status       text not null default 'pending' check (status in ('pending', 'completed', 'needs_review')),
     entry_id     uuid references journal_entries (id),
     created_at   timestamptz not null default now(),
     settled_at   timestamptz
 );
 
--- Every webhook delivery that passed the signature check, and what was done with it.
+-- What was done with each webhook that passed the signature check. A redelivery with the same
+-- outcome is not stored again, so replaying a captured webhook cannot grow this table.
 create table webhook_events (
     id          bigserial primary key,
     provider    text not null,
@@ -113,6 +117,9 @@ create table webhook_events (
     outcome     text not null,
     received_at timestamptz not null default now()
 );
+
+create unique index webhook_events_once
+    on webhook_events (provider, event, coalesce(reference, ''), outcome);
 
 -- Responses to write requests, keyed by the client's Idempotency-Key, so a retried request
 -- returns the original response instead of moving money twice.
@@ -123,3 +130,6 @@ create table idempotency_keys (
     response     jsonb not null,
     created_at   timestamptz not null default now()
 );
+
+-- For pruning old keys, for example: delete from idempotency_keys where created_at < now() - interval '7 days'
+create index idempotency_keys_created_at on idempotency_keys (created_at);

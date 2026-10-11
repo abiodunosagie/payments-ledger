@@ -8,27 +8,29 @@ license = "MIT"
 authors = ["Abiodun Osagie"]
 repository = "https://github.com/abiodunosagie/payments-ledger"
 readme = "README.md"
+publish = false
 keywords = ["ledger", "payments", "double-entry", "paystack", "axum"]
 categories = ["finance", "web-programming::http-server"]
 
 [dependencies]
 axum = "0.8"
 chrono = { version = "0.4.45", default-features = false, features = ["serde", "clock"] }
-futures = { version = "0.3.34", default-features = false, features = ["std"] }
 hex = "0.4.3"
 hmac = "0.13.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.152"
 sha2 = "0.11.0"
-sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "chrono", "migrate", "macros"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "migrate", "macros"] }
 subtle = "2.6.1"
 thiserror = "2.0.21"
 tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tower-http = { version = "0.6", features = ["timeout"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.28.0", features = ["v4", "serde"] }
 
 [dev-dependencies]
+futures = "0.3.34"
 tower = { version = "0.5.3", features = ["util"] }
 
 [profile.release]

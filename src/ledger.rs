@@ -10,6 +10,17 @@ use uuid::Uuid;
 /// Largest amount accepted in one request, in minor units: 10^15 (ten trillion naira in kobo).
 /// Far below `i64::MAX`, so summing many postings cannot overflow.
 pub const MAX_AMOUNT: i64 = 1_000_000_000_000_000;
+/// Mirrors the `accounts.name` check in the migration.
+pub const MAX_NAME_CHARS: usize = 100;
+/// Mirrors the `journal_entries.description` check in the migration.
+pub const MAX_DESCRIPTION_CHARS: usize = 200;
+
+/// The columns of [`Account`], shared by every query that returns one.
+macro_rules! account_columns {
+    () => {
+        "id, name, currency, kind, balance, created_at"
+    };
+}
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Account {
@@ -26,6 +37,22 @@ pub struct Account {
 pub struct Leg {
     pub account_id: Uuid,
     pub amount: i64,
+}
+
+/// Why money moved. Mirrors the `journal_entries.kind` check in the migration.
+#[derive(Debug, Clone, Copy)]
+pub enum EntryKind {
+    Transfer,
+    Deposit,
+}
+
+impl EntryKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            EntryKind::Transfer => "transfer",
+            EntryKind::Deposit => "deposit",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -57,20 +84,37 @@ pub fn validate_currency(currency: &str) -> Result<(), ApiError> {
     }
 }
 
+/// Free text from a client: bounded, and without control characters. Postgres rejects NUL in
+/// `text`, so without this check a NUL would surface as a server error instead of a 400.
+fn validate_text(field: &str, value: &str, max_chars: usize) -> Result<(), ApiError> {
+    if value.chars().count() > max_chars {
+        return Err(ApiError::bad_request(format!(
+            "{field} must be at most {max_chars} characters"
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ApiError::bad_request(format!(
+            "{field} must not contain control characters"
+        )));
+    }
+    Ok(())
+}
+
 pub async fn create_account(
     conn: &mut PgConnection,
     name: &str,
     currency: &str,
 ) -> Result<Account, ApiError> {
     let name = name.trim();
-    if name.is_empty() || name.chars().count() > 100 {
-        return Err(ApiError::bad_request("name must be 1 to 100 characters"));
+    if name.is_empty() {
+        return Err(ApiError::bad_request("name must not be empty"));
     }
+    validate_text("name", name, MAX_NAME_CHARS)?;
     validate_currency(currency)?;
-    let account = sqlx::query_as::<_, Account>(
-        "insert into accounts (id, name, currency, kind) values ($1, $2, $3, 'user')
-         returning id, name, currency, kind, balance, created_at",
-    )
+    let account = sqlx::query_as::<_, Account>(concat!(
+        "insert into accounts (id, name, currency, kind) values ($1, $2, $3, 'user') returning ",
+        account_columns!()
+    ))
     .bind(Uuid::new_v4())
     .bind(name)
     .bind(currency)
@@ -80,10 +124,11 @@ pub async fn create_account(
 }
 
 pub async fn find_account(conn: &mut PgConnection, id: Uuid) -> Result<Account, ApiError> {
-    sqlx::query_as::<_, Account>(
-        "select id, name, currency, kind, balance, created_at from accounts
-         where id = $1 and kind = 'user'",
-    )
+    sqlx::query_as::<_, Account>(concat!(
+        "select ",
+        account_columns!(),
+        " from accounts where id = $1 and kind = 'user'"
+    ))
     .bind(id)
     .fetch_optional(&mut *conn)
     .await?
@@ -136,15 +181,14 @@ pub async fn transfer(
             "from_account and to_account must differ",
         ));
     }
-    if description.is_some_and(|d| d.chars().count() > 200) {
-        return Err(ApiError::bad_request(
-            "description must be at most 200 characters",
-        ));
+    if let Some(d) = description {
+        validate_text("description", d, MAX_DESCRIPTION_CHARS)?;
     }
-    let locked = sqlx::query_as::<_, Account>(
-        "select id, name, currency, kind, balance, created_at from accounts
-         where id = any($1) and kind = 'user' order by id for update",
-    )
+    let locked = sqlx::query_as::<_, Account>(concat!(
+        "select ",
+        account_columns!(),
+        " from accounts where id = any($1) and kind = 'user' order by id for update"
+    ))
     .bind(vec![from, to])
     .fetch_all(&mut *conn)
     .await?;
@@ -173,7 +217,7 @@ pub async fn transfer(
     }
     post_entry(
         conn,
-        "transfer",
+        EntryKind::Transfer,
         description,
         &source.currency,
         &[
@@ -194,16 +238,21 @@ pub async fn transfer(
 /// that the legs sum to zero (at commit) and that no balance goes below zero.
 pub async fn post_entry(
     conn: &mut PgConnection,
-    kind: &str,
+    kind: EntryKind,
     description: Option<&str>,
     currency: &str,
     legs: &[Leg],
 ) -> Result<Uuid, ApiError> {
-    debug_assert_eq!(legs.iter().map(|l| l.amount).sum::<i64>(), 0);
+    // Callers build the legs, so an imbalance here is a bug; refuse it in release builds too,
+    // before the database trigger would.
+    if legs.len() < 2 || legs.iter().map(|l| l.amount).sum::<i64>() != 0 {
+        tracing::error!(?legs, "refusing an unbalanced journal entry");
+        return Err(ApiError::internal());
+    }
     let entry_id = Uuid::new_v4();
     sqlx::query("insert into journal_entries (id, kind, description) values ($1, $2, $3)")
         .bind(entry_id)
-        .bind(kind)
+        .bind(kind.as_str())
         .bind(description)
         .execute(&mut *conn)
         .await?;
@@ -228,6 +277,10 @@ pub async fn post_entry(
 
 /// A page of an account's postings, newest first. `before` is the last posting id of the
 /// previous page.
+///
+/// Pages follow posting ids, which are assigned when a transaction writes, not when it commits.
+/// A transfer that commits while a client is paging can land behind its cursor; a client that
+/// reconciles should re-read from the top rather than trust one pass.
 pub async fn statement(
     conn: &mut PgConnection,
     account_id: Uuid,

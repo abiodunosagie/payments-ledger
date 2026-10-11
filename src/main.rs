@@ -9,6 +9,10 @@ use payments_ledger::{AppState, MIGRATOR, app};
 use sqlx::postgres::PgPoolOptions;
 use std::process::ExitCode;
 
+/// A shorter API key is too easy to guess; `openssl rand -hex 32` gives 64 characters.
+const MIN_API_KEY_LEN: usize = 32;
+const POOL_SIZE: u32 = 10;
+
 fn required(name: &str) -> Result<String, String> {
     std::env::var(name)
         .ok()
@@ -19,15 +23,17 @@ fn required(name: &str) -> Result<String, String> {
 async fn run() -> Result<(), String> {
     let database_url = required("DATABASE_URL")?;
     let api_key = required("LEDGER_API_KEY")?;
-    if api_key.len() < 32 {
-        return Err("LEDGER_API_KEY must be at least 32 characters".into());
+    if api_key.len() < MIN_API_KEY_LEN {
+        return Err(format!(
+            "LEDGER_API_KEY must be at least {MIN_API_KEY_LEN} characters"
+        ));
     }
     let paystack_secret = required("PAYSTACK_SECRET_KEY")?;
     let bind = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
 
     // Error messages name the step, never the connection string or a key.
     let pool = PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(POOL_SIZE)
         .connect(&database_url)
         .await
         .map_err(|e| format!("could not connect to the database: {e}"))?;
