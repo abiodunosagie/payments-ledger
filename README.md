@@ -1,4 +1,4 @@
-# payments-ledger
+<img src="brand/banner.svg" alt="payments-ledger: a double-entry payments ledger in Rust" width="100%">
 
 [![CI](https://github.com/abiodunosagie/payments-ledger/actions/workflows/ci.yml/badge.svg)](https://github.com/abiodunosagie/payments-ledger/actions/workflows/ci.yml)
 
@@ -174,6 +174,7 @@ src/
   auth.rs         bearer API key
   error.rs        JSON errors that never leak internals
 tests/api.rs      end-to-end tests against Postgres
+brand/            logo masters, banner and guidelines (python3 brand/generate.py)
 ```
 
 ## Not included
